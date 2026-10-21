@@ -1,0 +1,161 @@
+services:
+
+  # -----------------------------------------
+  # 1. Apache Kafka - Streaming Message Broker
+  # -----------------------------------------
+  kafka:
+    image: apache/kafka:3.9.1
+    container_name: monitoring_kafka
+    hostname: kafka
+    ports:
+      - "29092:29092"
+
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      KAFKA_LISTENERS: CONTROLLER://kafka:9093,PLAINTEXT://kafka:9092,PLAINTEXT_HOST://0.0.0.0:29092
+
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      KAFKA_NUM_PARTITIONS: 3
+
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+    networks:
+      - monitoring_network
+
+    restart: unless-stopped
+
+
+  # -----------------------------------------
+  # 2. Spark Master - Coordinates Processing
+  # -----------------------------------------
+  spark-master:
+    image: apache/spark:3.5.5
+    container_name: monitoring_spark_master
+
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+
+    ports:
+      - "8081:8080"
+      - "7077:7077"
+
+    volumes:
+      - ./spark:/opt/spark-app
+
+    networks:
+      - monitoring_network
+
+    restart: unless-stopped
+
+
+  # -----------------------------------------
+  # 3. Spark Worker - Executes Processing Tasks
+  # -----------------------------------------
+  spark-worker:
+    image: apache/spark:3.5.5
+    container_name: monitoring_spark_worker
+
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+
+    depends_on:
+      - spark-master
+
+    ports:
+      - "8082:8081"
+
+    volumes:
+      - ./spark:/opt/spark-app
+
+    networks:
+      - monitoring_network
+
+    restart: unless-stopped
+
+
+  # -----------------------------------------
+  # 4. Prometheus - Collects Monitoring Metrics
+  # -----------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: monitoring_prometheus
+
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+
+    ports:
+      - "9090:9090"
+
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+
+    networks:
+      - monitoring_network
+
+    restart: unless-stopped
+
+
+  # -----------------------------------------
+  # 5. Grafana - Monitoring Dashboards
+  # -----------------------------------------
+  grafana:
+    image: grafana/grafana:12.1.0
+    container_name: monitoring_grafana
+
+    ports:
+      - "3000:3000"
+
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+    depends_on:
+      - prometheus
+
+    networks:
+      - monitoring_network
+
+    restart: unless-stopped
+
+
+# -----------------------------------------
+# Persistent Storage
+# -----------------------------------------
+volumes:
+  kafka_data:
+  prometheus_data:
+  grafana_data:
+
+
+# -----------------------------------------
+# Shared Network
+# -----------------------------------------
+networks:
+  monitoring_network:
+    driver: bridge

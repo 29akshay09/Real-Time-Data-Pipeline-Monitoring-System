@@ -1,0 +1,32 @@
+import platform
+
+from .gssapi import SaslMechanismGSSAPI
+from .msk import SaslMechanismAwsMskIam
+from .oauth import SaslMechanismOAuth
+from .plain import SaslMechanismPlain
+from .scram import SaslMechanismScram
+from .sspi import SaslMechanismSSPI
+
+
+SASL_MECHANISMS = {}
+
+
+def register_sasl_mechanism(name, klass, overwrite=False):
+    if not overwrite and name in SASL_MECHANISMS:
+        raise ValueError('Sasl mechanism %s already defined!' % name)
+    SASL_MECHANISMS[name] = klass
+
+
+def get_sasl_mechanism(name):
+    return SASL_MECHANISMS[name]
+
+
+register_sasl_mechanism('AWS_MSK_IAM', SaslMechanismAwsMskIam)
+if platform.system() == 'Windows':
+    register_sasl_mechanism('GSSAPI', SaslMechanismSSPI)
+else:
+    register_sasl_mechanism('GSSAPI', SaslMechanismGSSAPI)
+register_sasl_mechanism('OAUTHBEARER', SaslMechanismOAuth)
+register_sasl_mechanism('PLAIN', SaslMechanismPlain)
+register_sasl_mechanism('SCRAM-SHA-256', SaslMechanismScram)
+register_sasl_mechanism('SCRAM-SHA-512', SaslMechanismScram)

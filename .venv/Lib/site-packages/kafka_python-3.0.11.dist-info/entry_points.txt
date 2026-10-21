@@ -1,0 +1,2 @@
+[console_scripts]
+kafka-python = kafka.cli:run_cli

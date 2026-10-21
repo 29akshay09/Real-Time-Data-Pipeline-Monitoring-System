@@ -1,0 +1,754 @@
+"""Group management mixin for KafkaAdminClient."""
+
+from __future__ import annotations
+
+from enum import Enum
+import itertools
+import logging
+from collections import defaultdict
+import struct
+from typing import TYPE_CHECKING
+
+import kafka.errors as Errors
+from kafka.admin._acls import valid_acl_operations
+from kafka.protocol.admin import DeleteGroupsRequest, DescribeGroupsRequest, ListGroupsRequest
+from kafka.protocol.consumer import (
+    LeaveGroupRequest, OffsetCommitRequest, OffsetDeleteRequest, OffsetFetchRequest,
+    OffsetSpec, OffsetTimestamp,
+)
+from kafka.protocol.consumer.group import DEFAULT_GENERATION_ID, UNKNOWN_MEMBER_ID
+from kafka.protocol.consumer.metadata import (
+    ConsumerProtocolAssignment, ConsumerProtocolSubscription, ConsumerProtocolType,
+)
+from kafka.structs import OffsetAndMetadata, TopicPartition
+from kafka.util import EnumHelper
+
+if TYPE_CHECKING:
+    from kafka.net.manager import KafkaConnectionManager
+
+log = logging.getLogger(__name__)
+
+
+class GroupAdminMixin:
+    """Mixin providing consumer group management methods for KafkaAdminClient."""
+    _manager: KafkaConnectionManager
+    config: dict
+
+    # -- Describe groups ----------------------------------------------
+
+    def _describe_groups_request(self, group_ids):
+        request = DescribeGroupsRequest(
+            groups=list(group_ids),
+            include_authorized_operations=True
+        )
+        return request
+
+    def _describe_groups_process_response(self, response):
+        """Process a DescribeGroupsResponse into a group description."""
+        for group in response.groups:
+            for member in group.members:
+                if member.member_metadata:
+                    try:
+                        member.member_metadata = ConsumerProtocolSubscription.decode(member.member_metadata)
+                    except struct.error:
+                        log.warning(f'Unable to decode member_metadata for {group}/{member.member_id}')
+                        pass
+                if member.member_assignment:
+                    try:
+                        member.member_assignment = ConsumerProtocolAssignment.decode(member.member_assignment)
+                    except struct.error:
+                        log.warning(f'Unable to decode member_assignment for {group}/{member.member_id}')
+                        pass
+        # Return dict (key, val) tuples
+        results = {}
+        for group in response.groups:
+            group_id = group.group_id
+            result = self._process_acl_operations(group.to_dict())
+            error_code = result.pop('error_code')
+            error_message = result.pop('error_message', '') # v6+
+            result['error'] = str(Errors.for_code(error_code)(error_message)) if error_code else None
+            results[group_id] = result
+        return results
+
+    async def _async_describe_groups(self, group_ids, group_coordinator_id=None):
+        # Bucket groups by coordinator. One DescribeGroups per coordinator.
+        coordinators_groups = defaultdict(list)
+        if group_coordinator_id is not None:
+            coordinators_groups[group_coordinator_id] = list(group_ids)
+        else:
+            coordinator_ids = await self._find_coordinator_ids(group_ids)
+            for group_id, coordinator_id in coordinator_ids.items():
+                coordinators_groups[coordinator_id].append(group_id)
+
+        results = {}
+        for coordinator_id, coordinator_group_ids in coordinators_groups.items():
+            request = self._describe_groups_request(coordinator_group_ids)
+            response = await self._manager.send(request, node_id=coordinator_id)
+            results.update(self._describe_groups_process_response(response))
+        return results
+
+    def describe_groups(self, group_ids, group_coordinator_id=None, include_authorized_operations=False):
+        """Describe a set of consumer groups.
+
+        Any errors are immediately raised.
+
+        Arguments:
+            group_ids: A list of consumer group IDs. These are typically the
+                group names as strings.
+
+        Keyword Arguments:
+            group_coordinator_id (int, optional): The node_id of the groups' coordinator
+                broker. If set to None, it will query the cluster for each group to
+                find that group's coordinator. Explicitly specifying this can be
+                useful for avoiding extra network round trips if you already know
+                the group coordinator. This is only useful when all the group_ids
+                have the same coordinator, otherwise it will error. Default: None.
+
+        Returns:
+            A dict of {group_id: {key: val}}. key/vals are simple to_dict translations
+                of the raw results from DescribeGroupsResponse (with inline decoding
+                of ConsumerSubscription and ConsumerAssignment metadata, and conversion
+                of acl set ints to semantic enums).
+        """
+        return self._manager.run(self._async_describe_groups, group_ids, group_coordinator_id)
+
+    # -- List groups --------------------------------------------------
+
+    @staticmethod
+    def _list_groups_request(states_filter=None, types_filter=None):
+        kwargs = {'min_version': 0}
+        if states_filter:
+            kwargs['states_filter'] = [GroupState.value_for(s) for s in states_filter]
+            kwargs['min_version'] = 4
+        if types_filter:
+            kwargs['types_filter'] = [GroupType.value_for(t) for t in types_filter]
+            kwargs['min_version'] = 5
+        return ListGroupsRequest(**kwargs)
+
+    def _list_groups_process_response(self, response):
+        """Process a ListGroupsResponse into a list of groups."""
+        error_type = Errors.for_code(response.error_code)
+        if error_type is not Errors.NoError:
+            raise error_type(
+                "ListGroupsRequest failed with response '{}'."
+                .format(response))
+        return [group.to_dict() for group in response.groups]
+
+    async def _async_list_groups(self, broker_ids=None, states_filter=None, types_filter=None):
+        if broker_ids is None:
+            broker_ids = [broker.node_id for broker in self._manager.cluster.brokers()]
+        groups = []
+        for broker_id in broker_ids:
+            request = self._list_groups_request(states_filter=states_filter,
+                                                types_filter=types_filter)
+            response = await self._manager.send(request, node_id=broker_id)
+            groups.extend(self._list_groups_process_response(response))
+        return groups
+
+    def list_groups(self, broker_ids=None, states_filter=None, types_filter=None):
+        """List all consumer groups known to the cluster.
+
+        This returns a list of Group dicts. The tuples are
+        composed of the consumer group name and the consumer group protocol
+        type.
+
+        Only consumer groups that store their offsets in Kafka are returned.
+        The protocol type will be an empty string for groups created using
+        Kafka < 0.9 APIs because, although they store their offsets in Kafka,
+        they don't use Kafka for group coordination. For groups created using
+        Kafka >= 0.9, the protocol type will typically be "consumer".
+
+        As soon as any error is encountered, it is immediately raised.
+
+        Keyword Arguments:
+            broker_ids ([int], optional): A list of broker node_ids to query for consumer
+                groups. If set to None, will query all brokers in the cluster.
+                Explicitly specifying broker(s) can be useful for determining which
+                consumer groups are coordinated by those broker(s). Default: None
+            states_filter (list, optional): Filter groups by state. Values
+                may be :class:`GroupState` members, their string names
+                (case-insensitive, hyphen or underscore), or raw protocol
+                strings (e.g. ``['Stable', 'Empty']``). Requires broker
+                >= 3.0 (KIP-518). Default: None (no filter).
+            types_filter (list, optional): Filter groups by type. Values
+                may be :class:`GroupType` members, their string names
+                (case-insensitive), or raw protocol strings (e.g.
+                ``['consumer', 'classic', 'share']``). Requires broker
+                >= 4.0 (KIP-848). Default: None (no filter).
+
+        Returns:
+            List of group data dicts, with key/vals from ListGroupsRequest
+        """
+        return self._manager.run(self._async_list_groups, broker_ids,
+                                 states_filter, types_filter)
+
+    # -- List group offsets -------------------------------------------
+
+    def _list_group_offsets_requests(self, group_specs):
+        _Topic = OffsetFetchRequest.OffsetFetchRequestTopic
+        _Group = OffsetFetchRequest.OffsetFetchRequestGroup
+        _GroupTopic = _Group.OffsetFetchRequestTopics
+        max_version = 8
+
+        groups = []
+        for group_id, partitions in group_specs.items():
+            if partitions is None:
+                group_topics = None
+            else:
+                topics_partitions = defaultdict(set)
+                for topic, partition in partitions:
+                    topics_partitions[topic].add(partition)
+                group_topics = [
+                    _GroupTopic(name=name, partition_indexes=list(parts))
+                    for name, parts in topics_partitions.items()
+                ]
+            groups.append(_Group(group_id=group_id, topics=group_topics))
+
+        if len(groups) == 0:
+            raise ValueError('Empty group_specs!')
+        # Return multple requests when broker does not support v8+
+        if self._manager.broker_version_data.api_version(OffsetFetchRequest) < 8:
+            for group in groups:
+                min_version = 2 if group.topics is None else 0
+                yield (group.group_id, OffsetFetchRequest(group_id=group.group_id,
+                                                          topics=group.topics,
+                                                          min_version=min_version,
+                                                          max_version=max_version))
+        else:
+            yield (None, OffsetFetchRequest(groups=groups,
+                                            min_version=8,
+                                            max_version=max_version))
+
+    @staticmethod
+    def _parse_group_offsets(group):
+        """Build {TopicPartition: OffsetAndMetadata} from an OffsetFetchResponse or OffsetFetchResponseGroup."""
+        error_type = Errors.for_code(group.error_code)
+        if error_type is not Errors.NoError:
+            raise error_type(
+                "OffsetFetchResponse failed for group '{}'.".format(group.group_id))
+        results = {}
+        for topic in group.topics:
+            for partition in topic.partitions:
+                tp = TopicPartition(topic.name, partition.partition_index)
+                partition_error = Errors.for_code(partition.error_code)
+                if partition_error is not Errors.NoError:
+                    raise partition_error(
+                        f"OffsetFetchResponse failed for partition {tp.partition}")
+                results[tp] = OffsetAndMetadata(
+                    offset=partition.committed_offset,
+                    metadata=partition.metadata,
+                    leader_epoch=partition.committed_leader_epoch,
+                )
+        return results
+
+    def _list_group_offsets_process_response(self, response, group_id=None):
+        """Process an OffsetFetchResponse."""
+        error_type = Errors.for_code(response.error_code)
+        if error_type is not Errors.NoError:
+            raise error_type(
+                "OffsetFetchResponse failed with response '{}'."
+                .format(response))
+        if response.API_VERSION >= 8:
+            return {group.group_id: self._parse_group_offsets(group)
+                    for group in response.groups}
+        else:
+            return {group_id: self._parse_group_offsets(response)}
+
+    async def _async_list_group_offsets(self, group_specs):
+        # Bucket groups by coordinator. One OffsetFetch per coordinator.
+        coordinators_groups = defaultdict(list)
+        coordinator_ids = await self._find_coordinator_ids(list(group_specs))
+        for group_id, coordinator_id in coordinator_ids.items():
+            coordinators_groups[coordinator_id].append(group_id)
+
+        results = {}
+        _Group = OffsetFetchRequest.OffsetFetchRequestGroup
+        _GroupTopic = _Group.OffsetFetchRequestTopics
+        for coordinator_id, group_ids in coordinators_groups.items():
+            for group_id, request in self._list_group_offsets_requests({group_id: group_specs[group_id]
+                                                                        for group_id in group_ids}):
+                response = await self._manager.send(request, node_id=coordinator_id)
+                results.update(self._list_group_offsets_process_response(response, group_id=group_id))
+        return results
+
+    def list_group_offsets(self, group_specs):
+        """Fetch committed offsets for one or more consumer groups.
+
+        On brokers supporting OffsetFetch v8+ (Apache Kafka 3.0+, KIP-709), this
+        issues a single OffsetFetch per coordinator covering all groups
+        hosted by that coordinator. On older brokers it currently only supports
+        one consumer group (per coordinator).
+
+        Arguments:
+            group_specs (dict): Mapping of group_id (str) to either a list of
+                :class:`~kafka.TopicPartition` to fetch, or None to fetch all
+                committed offsets for that group.
+                Or, one or more group_id (str or list[str]) to fetch all offsets
+                for each group.
+
+        Returns:
+            A dict mapping group_id (str) to a dict mapping
+                :class:`~kafka.TopicPartition` to
+                :class:`~kafka.structs.OffsetAndMetadata`.
+
+        Raises:
+            UnsupportedVersionError: if multiple groups are requested against
+                a broker that does not support OffsetFetch v8+; or if group_spec
+                with value None against a broker that does not support
+                OffsetFetch v2+.
+            BrokerResponseError: as soon as any group- or partition-level error
+                is encountered.
+        """
+        if isinstance(group_specs, list):
+            group_specs = {group_id: None for group_id in group_specs}
+        elif isinstance(group_specs, str):
+            group_specs = {group_specs: None}
+        return self._manager.run(self._async_list_group_offsets, group_specs)
+
+    # -- Delete groups ------------------------------------------------
+
+    def _delete_groups_request(self, group_ids):
+        return DeleteGroupsRequest(groups_names=group_ids)
+
+    def _convert_delete_groups_response(self, response):
+        """Parse a DeleteGroupsResponse."""
+        results = []
+        for group_id, error_code in response.results:
+            res = 'OK' if error_code == 0 else Errors.for_code(error_code).__name__
+            results.append((group_id, res))
+        return results
+
+    async def _async_delete_groups(self, group_ids, group_coordinator_id=None):
+        coordinators_groups = defaultdict(list)
+        if group_coordinator_id is not None:
+            coordinators_groups[group_coordinator_id] = group_ids
+        else:
+            coordinator_ids = await self._find_coordinator_ids(group_ids)
+            for group_id, coordinator_id in coordinator_ids.items():
+                coordinators_groups[coordinator_id].append(group_id)
+
+        results = []
+        for coordinator_id, coordinator_group_ids in coordinators_groups.items():
+            request = self._delete_groups_request(coordinator_group_ids)
+            response = await self._manager.send(request, node_id=coordinator_id)
+            results.extend(self._convert_delete_groups_response(response))
+        return dict(results)
+
+    def delete_groups(self, group_ids, group_coordinator_id=None):
+        """Delete Group Offsets for given consumer groups.
+
+        Note:
+        This does not verify that the group ids actually exist and
+        group_coordinator_id is the correct coordinator for all these groups.
+
+        The result needs checking for potential errors.
+
+        Arguments:
+            group_ids ([str]): The consumer group ids of the groups which are to be deleted.
+
+        Keyword Arguments:
+            group_coordinator_id (int, optional): The node_id of the broker which is
+                the coordinator for all the groups. Default: None.
+
+        Returns:
+            A list of tuples (group_id, KafkaError)
+        """
+        return self._manager.run(self._async_delete_groups, group_ids, group_coordinator_id)
+
+    # -- Alter group offsets -----------------------------------------------
+
+    @staticmethod
+    def _alter_group_offsets_request(group_id, offsets):
+        _Topic = OffsetCommitRequest.OffsetCommitRequestTopic
+        _Partition = _Topic.OffsetCommitRequestPartition
+        topic2partitions = defaultdict(list)
+        for tp, oam in offsets.items():
+            topic2partitions[tp.topic].append(_Partition(
+                partition_index=tp.partition,
+                committed_offset=oam.offset,
+                committed_leader_epoch=-1 if oam.leader_epoch is None else oam.leader_epoch,
+                committed_metadata=oam.metadata,
+            ))
+        return OffsetCommitRequest(
+            group_id=group_id,
+            generation_id_or_member_epoch=DEFAULT_GENERATION_ID,
+            member_id=UNKNOWN_MEMBER_ID,
+            group_instance_id=None,
+            retention_time_ms=-1,
+            topics=[_Topic(name=name, partitions=parts)
+                    for name, parts in topic2partitions.items()],
+            max_version=8,
+        )
+
+    @staticmethod
+    def _alter_group_offsets_process_response(response):
+        results = {}
+        for topic in response.topics:
+            for partition in topic.partitions:
+                results[TopicPartition(topic.name, partition.partition_index)] = \
+                    Errors.for_code(partition.error_code)
+        return results
+
+    async def _async_alter_group_offsets(self, group_id, offsets, group_coordinator_id=None):
+        if not offsets:
+            return {}
+        if group_coordinator_id is None:
+            group_coordinator_id = await self._find_coordinator_id(group_id)
+        request = self._alter_group_offsets_request(group_id, offsets)
+        response = await self._manager.send(request, node_id=group_coordinator_id)
+        return self._alter_group_offsets_process_response(response)
+
+    def alter_group_offsets(self, group_id, offsets, group_coordinator_id=None):
+        """Alter committed offsets for a consumer group.
+
+        The group must have no active members (i.e. be empty or dead) for
+        the commit to succeed; otherwise individual partitions may return
+        ``UNKNOWN_MEMBER_ID`` or similar errors.
+
+        Arguments:
+            group_id (str): The consumer group id.
+            offsets (dict): A dict mapping :class:`~kafka.TopicPartition` to
+                :class:`~kafka.structs.OffsetAndMetadata`.
+
+        Keyword Arguments:
+            group_coordinator_id (int, optional): The node_id of the group's
+                coordinator broker. If None, the cluster will be queried to
+                locate the coordinator. Default: None.
+
+        Returns:
+            dict: A dict mapping :class:`~kafka.TopicPartition` to the
+            partition-level :class:`~kafka.errors.KafkaError` class
+            (``NoError`` on success).
+        """
+        return self._manager.run(
+            self._async_alter_group_offsets, group_id, offsets, group_coordinator_id)
+
+    # -- Reset group offsets ----------------------------------------------
+
+    @staticmethod
+    def _reset_group_offsets_process_response(response, to_reset):
+        results = {}
+        for topic in response.topics:
+            for partition in topic.partitions:
+                tp = TopicPartition(topic.name, partition.partition_index)
+                results[tp] = {
+                    'error': Errors.for_code(partition.error_code),
+                    'offset': to_reset[tp].offset
+                }
+        return results
+
+    @staticmethod
+    def _clamp_offset(raw, earliest, latest):
+        if raw < 0 or raw > latest:
+            return latest
+        if raw < earliest:
+            return earliest
+        return raw
+
+    async def _async_reset_group_offsets(self, group_id, offset_specs, group_coordinator_id=None):
+        if not offset_specs:
+            return {}
+        all_tps = set(offset_specs.keys())
+
+        explicit_offsets = {}
+        for tp, val in list(offset_specs.items()):
+            if isinstance(val, (OffsetSpec, OffsetTimestamp)):
+                pass
+            elif isinstance(val, int):
+                explicit_offsets[tp] = offset_specs.pop(tp)
+            else:
+                raise TypeError(
+                    f'Unsupported reset target for {tp}: {val!r} '
+                    '(expected OffsetSpec, OffsetTimestamp, or int offset)')
+
+        if group_coordinator_id is None:
+            group_coordinator_id = await self._find_coordinator_id(group_id)
+
+        current = (await self._async_list_group_offsets({group_id: list(all_tps)}))[group_id]
+        earliest = await self._async_list_partition_offsets({tp: OffsetSpec.EARLIEST for tp in all_tps})
+        latest = await self._async_list_partition_offsets({tp: OffsetSpec.LATEST for tp in all_tps})
+
+        offsets = {}
+        if offset_specs:
+            offsets = await self._async_list_partition_offsets(offset_specs)
+
+        to_reset = {}
+        for tp in all_tps:
+            if tp in offsets:
+                raw = offsets[tp].offset
+            else:
+                raw = explicit_offsets[tp]
+            clamped = self._clamp_offset(raw, earliest[tp].offset, latest[tp].offset)
+            if tp in current:
+                to_reset[tp] = current[tp]._replace(offset=clamped)
+            else:
+                to_reset[tp] = OffsetAndMetadata(offset=clamped, metadata='', leader_epoch=None)
+
+        request = self._alter_group_offsets_request(group_id, to_reset)
+        response = await self._manager.send(request, node_id=group_coordinator_id)
+        return self._reset_group_offsets_process_response(response, to_reset)
+
+    def reset_group_offsets(self, group_id, offset_specs, group_coordinator_id=None):
+        """Reset committed offsets for a consumer group.
+
+        The group must have no active members (i.e. be empty or dead) for
+        the reset to succeed; otherwise individual partitions may return
+        ``UNKNOWN_MEMBER_ID`` or similar errors.
+
+        Each dict value selects how the target offset is produced. All
+        resulting offsets are clamped to the partition's
+        ``[earliest, latest]`` range; values that resolve to
+        ``UNKNOWN_OFFSET`` (e.g. a timestamp beyond the last record) are
+        clamped to ``latest``.
+
+        Arguments:
+            group_id (str): The consumer group id.
+            offset_specs (dict): A dict mapping :class:`~kafka.TopicPartition` to
+                one of:
+
+                * :class:`~kafka.admin.OffsetSpec` (e.g. ``OffsetSpec.EARLIEST``,
+                  ``OffsetSpec.LATEST``, ``OffsetSpec.MAX_TIMESTAMP``):
+                  resolved server-side via ListOffsets.
+                * :class:`~kafka.admin.OffsetTimestamp` (ms since epoch):
+                  resolved server-side to the earliest offset whose timestamp
+                  is ``>=`` the given value.
+                * Plain ``int``: an explicit committed offset (no server-side
+                  resolution), which is still clamped to the valid range.
+
+        Keyword Arguments:
+            group_coordinator_id (int, optional): The node_id of the group's
+                coordinator broker. If None, the cluster will be queried to
+                locate the coordinator. Default: None.
+
+        Returns:
+            dict: A dict mapping :class:`~kafka.TopicPartition` to dict of
+            {'error': :class:`~kafka.errors.KafkaError` class, 'offset': int}.
+            The ``offset`` value is the post-clamp value that was committed.
+        """
+        return self._manager.run(
+            self._async_reset_group_offsets, group_id, offset_specs, group_coordinator_id)
+
+    # -- Delete group offsets ----------------------------------------------
+
+    @staticmethod
+    def _delete_group_offsets_request(group_id, partitions):
+        _Topic = OffsetDeleteRequest.OffsetDeleteRequestTopic
+        _Partition = _Topic.OffsetDeleteRequestPartition
+        topic2partitions = defaultdict(list)
+        for tp in partitions:
+            topic2partitions[tp.topic].append(
+                _Partition(partition_index=tp.partition))
+        return OffsetDeleteRequest(
+            group_id=group_id,
+            topics=[_Topic(name=name, partitions=parts)
+                    for name, parts in topic2partitions.items()],
+        )
+
+    @staticmethod
+    def _delete_group_offsets_process_response(response):
+        top_level = Errors.for_code(response.error_code)
+        if top_level is not Errors.NoError:
+            raise top_level(
+                "OffsetDeleteRequest failed with response '{}'.".format(response))
+        results = {}
+        for topic in response.topics:
+            for partition in topic.partitions:
+                results[TopicPartition(topic.name, partition.partition_index)] = \
+                    Errors.for_code(partition.error_code)
+        return results
+
+    async def _async_delete_group_offsets(self, group_id, partitions, group_coordinator_id=None):
+        if not partitions:
+            return {}
+        if group_coordinator_id is None:
+            group_coordinator_id = await self._find_coordinator_id(group_id)
+        request = self._delete_group_offsets_request(group_id, partitions)
+        response = await self._manager.send(request, node_id=group_coordinator_id)
+        return self._delete_group_offsets_process_response(response)
+
+    def delete_group_offsets(self, group_id, partitions, group_coordinator_id=None):
+        """Delete committed offsets for a consumer group.
+
+        The group must have no active members subscribed to the given topics;
+        otherwise partitions may fail with ``GROUP_SUBSCRIBED_TO_TOPIC``.
+
+        Arguments:
+            group_id (str): The consumer group id.
+            partitions: An iterable of :class:`~kafka.TopicPartition` whose
+                committed offsets should be deleted.
+
+        Keyword Arguments:
+            group_coordinator_id (int, optional): The node_id of the group's
+                coordinator broker. If None, the cluster will be queried to
+                locate the coordinator. Default: None.
+
+        Returns:
+            dict: A dict mapping :class:`~kafka.TopicPartition` to the
+            partition-level :class:`~kafka.errors.KafkaError` class
+            (``NoError`` on success).
+
+        Raises:
+            KafkaError: If the response contains a top-level error (e.g.
+                ``GroupIdNotFoundError``, ``NonEmptyGroupError``).
+        """
+        return self._manager.run(
+            self._async_delete_group_offsets, group_id, partitions, group_coordinator_id)
+
+    # -- Remove group members ---------------------------------------------
+
+    @staticmethod
+    def _remove_group_members_batch_request(group_id, members, version):
+        _Member = LeaveGroupRequest.MemberIdentity
+        identities = []
+        for m in members:
+            kwargs = {
+                'member_id': m.member_id if m.member_id is not None else '',
+                'group_instance_id': m.group_instance_id,
+            }
+            if version >= 5:
+                kwargs['reason'] = m.reason
+            identities.append(_Member(**kwargs))
+        return LeaveGroupRequest(
+            group_id=group_id,
+            members=identities,
+            min_version=3,
+            max_version=version,
+        )
+
+    @staticmethod
+    def _remove_group_members_process_batch_response(response):
+        top_level = Errors.for_code(response.error_code)
+        if top_level is not Errors.NoError:
+            raise top_level(
+                "LeaveGroupRequest failed with response '{}'.".format(response))
+        return {
+            (m.member_id or m.group_instance_id): Errors.for_code(m.error_code)
+            for m in response.members
+        }
+
+    async def _async_remove_group_members(self, group_id, members,
+                                          group_coordinator_id=None):
+        if not members:
+            return {}
+        if group_coordinator_id is None:
+            group_coordinator_id = await self._find_coordinator_id(group_id)
+
+        version = self._manager.broker_version_data.api_version(LeaveGroupRequest)
+        batch_supported = version >= 3
+
+        if batch_supported:
+            request = self._remove_group_members_batch_request(
+                group_id, members, version)
+            response = await self._manager.send(request, node_id=group_coordinator_id)
+            return self._remove_group_members_process_batch_response(response)
+
+        results = {}
+        for m in members:
+            if m.group_instance_id is not None:
+                raise Errors.UnsupportedVersionError(
+                    "Broker does not support removing members by group.instance.id; "
+                    "requires LeaveGroup v3+ (Kafka 2.3+).")
+            if not m.member_id:
+                raise ValueError(
+                    "MemberToRemove.member_id is required when broker does not "
+                    "support batched LeaveGroupRequest (v3+).")
+            request = LeaveGroupRequest(
+                group_id=group_id,
+                member_id=m.member_id,
+                max_version=2,
+            )
+            response = await self._manager.send(request, node_id=group_coordinator_id)
+            results[m.member_id or m.group_instance_id] = Errors.for_code(response.error_code)
+        return results
+
+    def remove_group_members(self, group_id, members, group_coordinator_id=None):
+        """Remove members from a consumer group.
+
+        On brokers supporting LeaveGroup v3+ (Kafka 2.3+), a single batched
+        request is sent. On older brokers, falls back to one single-member
+        LeaveGroupRequest per member (in which case ``group_instance_id`` is
+        not supported and ``member_id`` is required).
+
+        Arguments:
+            group_id (str): The consumer group id.
+            members: An iterable of :class:`~kafka.admin.MemberToRemove`.
+                Each entry must set at least one of ``member_id`` or,
+                if brokers support LeaveGroup v3+, ``group_instance_id``.
+                ``reason`` is only sent to brokers supporting
+                LeaveGroup v5+ (KIP-800).
+
+        Keyword Arguments:
+            group_coordinator_id (int, optional): The node_id of the group's
+                coordinator broker. If None, the cluster will be queried to
+                locate the coordinator. Default: None.
+
+        Returns:
+            dict: A dict mapping :class:`~kafka.admin.MemberToRemove` to the
+            per-member :class:`~kafka.errors.KafkaError` class
+            (``NoError`` on success). The key's ``reason`` is always None in
+            the result (not echoed by the broker).
+
+        Raises:
+            KafkaError: If a batched response contains a top-level error.
+            UnsupportedVersionError: If the broker does not support batched
+                LeaveGroupRequest and any member uses ``group_instance_id``.
+        """
+        return self._manager.run(
+            self._async_remove_group_members, group_id, members, group_coordinator_id)
+
+
+class MemberToRemove:
+    """A consumer group member to remove via Admin.remove_group_members
+
+    At least one of ``member_id`` (identifying a dynamic group member)
+    or ``group_instance_id`` (identifying a static group member) must be set.
+
+    Keyword Arguments:
+        member_id (str or None): The dynamic member id (as assigned by the
+            coordinator in JoinGroupResponse). Use None for static-only removal.
+        group_instance_id (str or None): The static member instance id (the
+            ``group.instance.id`` configured on the member). Requires LeaveGroup
+            v3+ (Kafka 2.3+).
+        reason (str or None): Optional reason for removal (propagated to the
+            broker on LeaveGroup v5+; ignored on older brokers).
+    """
+    __slots__ = ('member_id', 'group_instance_id', 'reason')
+
+    def __init__(self, member_id=None, group_instance_id=None, reason=None):
+        self.member_id = member_id
+        self.group_instance_id = group_instance_id
+        self.reason = reason
+
+    def __repr__(self):
+        return "<MemberToRemove member_id={}, group_instance_id={}, reason={}>".format(
+            self.member_id, self.group_instance_id, self.reason)
+
+    def __eq__(self, other):
+        return all((
+            self.member_id == other.member_id,
+            self.group_instance_id == other.group_instance_id,
+            self.reason == other.reason,
+        ))
+
+    def __hash__(self):
+        return hash((self.member_id, self.group_instance_id, self.reason))
+
+
+class GroupState(EnumHelper, str, Enum):
+    """Consumer group states as reported by the broker (KIP-518, KIP-848)."""
+    UNKNOWN = 'Unknown'
+    PREPARING_REBALANCE = 'PreparingRebalance'
+    COMPLETING_REBALANCE = 'CompletingRebalance'
+    STABLE = 'Stable'
+    DEAD = 'Dead'
+    EMPTY = 'Empty'
+    ASSIGNING = 'Assigning'
+    RECONCILING = 'Reconciling'
+
+
+class GroupType(EnumHelper, str, Enum):
+    """Consumer group protocol types (KIP-848)."""
+    UNKNOWN = 'Unknown'
+    CLASSIC = 'classic'
+    CONSUMER = 'consumer'
+    SHARE = 'share'

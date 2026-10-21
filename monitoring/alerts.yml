@@ -1,0 +1,12 @@
+groups:
+  - name: pipeline-monitoring
+    rules:
+
+      - alert: PrometheusTargetDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A Prometheus monitoring target is down"
+          description: "A configured monitoring target has been unreachable for more than one minute."
